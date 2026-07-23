@@ -1,43 +1,60 @@
-# مراقب استهلاك التطبيقات (App Memory Tooltip)
+# MemHover
 
-أداة خلفية لنظام Windows تعرض استهلاك الذاكرة لأي تطبيق عند التمرير بالماوس فوق أيقونته في شريط المهام.
+**Hover. See. Optimize.**
 
-## المتطلبات
-- نظام **Windows 10 أو 11** (الكود يستخدم Win32 API مباشرة، لن يعمل على Linux/macOS).
-- تثبيت لغة Rust من الموقع الرسمي: https://rustup.rs
-- محرر أكواد مثل VS Code (اختياري).
+MemHover is a lightweight Windows background utility that displays real-time RAM usage when you hover your mouse over any application icon in the taskbar.
 
-## خطوات البناء والتشغيل
+Built with **Rust** and **Win32 API**, it provides instant insight into which apps are consuming the most memory without opening Task Manager.
 
-1. افتح Terminal (أو PowerShell) داخل مجلد المشروع.
-2. للتشغيل والتجربة أثناء التطوير:
-   ```
-   cargo run
-   ```
-3. لبناء نسخة نهائية صغيرة الحجم وسريعة:
-   ```
-   cargo build --release
-   ```
-   الملف التنفيذي الناتج سيكون في:
-   ```
-   target\release\app-memory-tooltip.exe
-   ```
+---
 
-## كيف يعمل الكود (ملخص)
+## Features
 
-1. **نافذة خفية رئيسية** تستقبل رسائل النظام ولا تظهر للمستخدم.
-2. **مؤقّت (Timer)** يفحص موضع الماوس كل 150 ملي ثانية.
-3. عند اكتشاف أن المؤشر فوق شريط المهام، يحدد الكود العملية (Process) الموجودة تحته عبر `WindowFromPoint` و `GetWindowThreadProcessId`.
-4. يقرأ استهلاك الذاكرة عبر `GetProcessMemoryInfo` من واجهة Win32.
-5. يعرض النتيجة في **نافذة Tooltip صغيرة بلا حدود** بجانب المؤشر مباشرة.
-6. أيقونة صغيرة تظهر في System Tray (بجانب الساعة) مع خيار "خروج".
+- **Hover to see** - Just move your mouse over any taskbar icon
+- **Real-time memory usage** - Updated every 150ms
+- **System tray integration** - Runs silently with exit option
+- **Ultra-lightweight** - ~1-3 MB executable, no runtime dependencies
+- **Native performance** - Direct Win32 API calls for minimal overhead
 
-## ملاحظات مهمة قبل التطوير المتقدم
+---
 
-- الكود الحالي **نموذج أولي (Prototype)** يوضح الفكرة الأساسية بشكل كامل وقابل للتشغيل، وليس نسخة نهائية جاهزة للتوزيع التجاري.
-- دقة اكتشاف "أي أيقونة بالضبط" فوق شريط المهام (خصوصًا في Windows 11 حيث التصميم مختلف عن 10) قد تحتاج تعديلًا إضافيًا حسب نسخة الويندوز، لأن مايكروسوفت غيّرت بنية شريط المهام الداخلية بين الإصدارات.
-- يُفضّل إضافة أيقونة مخصصة (.ico) بدل الأيقونة الافتراضية للنظام.
-- لتشغيل التطبيق تلقائيًا مع بدء ويندوز، يمكن إضافة اختصار في مجلد Startup أو تسجيله في الـ Registry.
+## Requirements
 
-## حجم الملف الناتج المتوقع
-بعد `cargo build --release` مع الإعدادات الموجودة في `Cargo.toml` (تحسين الحجم + strip)، الحجم المتوقع تقريبًا **1 إلى 3 ميجابايت**، بدون الحاجة لتثبيت أي Runtime إضافي على جهاز المستخدم.
+- **Windows 10** or **Windows 11** (uses Win32 API, won't work on Linux/macOS)
+- **Rust** (only for development) - Install from [rustup.rs](https://rustup.rs)
+
+---
+
+## 📁 Project Structure
+
+```text
+MemHover/
+├── src/
+│   ├── main.rs      # Core logic, window hooks, and pointer tracking
+│   └── ui.rs        # Tooltip rendering and Win32 UI management
+├── Cargo.toml       # Rust dependencies and project configuration
+└── README.md        # Project documentation
+
+Installation
+Option 1: Download Pre-built Binary (Recommended)
+1. Go to Releases
+
+2. Download memhover.exe
+
+3. Run it - no installation required
+
+
+Option 2: Build from Source
+
+# Clone the repository
+git clone [https://github.com/Crow-developers/MemHover.git](https://github.com/Crow-developers/MemHover.git)
+cd MemHover
+
+# Run during development
+cargo run
+
+# Build release version
+cargo build --release
+
+# The executable will be at:
+# target/release/memhover.exe
