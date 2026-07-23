@@ -1,5 +1,10 @@
-// أداة تعرض استهلاك الذاكرة لأي تطبيق مفتوح عند التمرير فوق أيقونته باستخدام UI Automation
 #![windows_subsystem = "windows"]
+
+//! MemHover - A lightweight Windows utility for real-time memory monitoring.
+//!
+//! This application operates as a background process, utilizing the UI Automation API
+//! to determine the application currently under the cursor and displaying its memory
+//! consumption metrics via a low-latency, transparent overlay (tooltip).
 
 use std::mem::size_of;
 use windows::core::*;
@@ -12,23 +17,42 @@ use windows::Win32::UI::Accessibility::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::System::Com::*;
-use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
 
+// Application-defined messages and identifiers
 const WM_TRAYICON: u32 = WM_APP + 1;
 const HOOK_CHECK_TIMER_ID: usize = 1;
 
+// Global state variables for UI components and COM interfaces
+// Note: In a production-grade application, these could be encapsulated within a context struct
+// passed via window userdata (GWLP_USERDATA), but static mut is utilized here for minimal overhead
+// in a strictly single-threaded message loop paradigm.
 static mut TOOLTIP_HWND: HWND = HWND(std::ptr::null_mut());
 static mut MAIN_HWND: HWND = HWND(std::ptr::null_mut());
-static mut LAST_PID: u32 = 0;
-static mut LAST_TEXT: Vec<u16> = Vec::new();
+static mut UI_AUTOMATION_INSTANCE: Option<IUIAutomation> = None;
+
+// Cached rendering data to minimize allocation overhead during the WM_PAINT cycle
+static mut TOOLTIP_LINES: Vec<Vec<u16>> = Vec::new();
+static mut LAST_HOVERED_PID: u32 = 0;
 
 fn main() -> Result<()> {
     unsafe {
+        // Initialize the COM library on the current thread.
+        // Required for UI Automation interfaces.
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        // Instantiate the UI Automation COM object once during initialization
+        // to prevent extreme overhead and CPU consumption in the high-frequency timer loop.
+        if let Ok(automation) = CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+            UI_AUTOMATION_INSTANCE = Some(automation);
+        } else {
+            // Fallback: Exit gracefully if UI Automation infrastructure cannot be initialized
+            CoUninitialize();
+            return Ok(());
+        }
 
         let instance = GetModuleHandleW(None)?;
 
-        
+        // Register and create the hidden main window responsible for message pumping and tray icon management.
         let main_class = w!("AppMemoryTooltipMainClass");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(main_wnd_proc),
@@ -47,7 +71,8 @@ fn main() -> Result<()> {
             None, None, instance, None,
         )?;
 
-        // Tooltip
+        // Register and create the tooltip overlay window.
+        // Utilizes layered window attributes (WS_EX_LAYERED) for hardware-accelerated transparency.
         let tooltip_class = w!("AppMemoryTooltipPopupClass");
         let wc2 = WNDCLASSW {
             lpfnWndProc: Some(tooltip_wnd_proc),
@@ -66,26 +91,33 @@ fn main() -> Result<()> {
             0, 0, 210, 65,
             None, None, instance, None,
         )?;
+        
+        // Apply alpha transparency channel to the tooltip window.
         SetLayeredWindowAttributes(TOOLTIP_HWND, COLORREF(0), 240, LWA_ALPHA)?;
 
-        
+        // Initialize the system tray notification icon.
         add_tray_icon(MAIN_HWND, instance)?;
 
-        //  مؤقّت يفحص الماوس كل 200 ملي ثانية
+        // Establish a high-resolution timer to poll cursor position periodically.
+        // Interval: 200ms provides an optimal balance between visual responsiveness and CPU conservation.
         SetTimer(MAIN_HWND, HOOK_CHECK_TIMER_ID, 200, None);
 
-        //  Loop message
+        // Standard Win32 message loop paradigm
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
+        // Graceful teardown of COM resources upon exit
+        UI_AUTOMATION_INSTANCE = None;
         CoUninitialize();
         Ok(())
     }
 }
 
+/// Main window procedure.
+/// Dispatches system messages, tray icon interactions, and timer events.
 unsafe extern "system" fn main_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -95,20 +127,20 @@ unsafe extern "system" fn main_wnd_proc(
     match msg {
         WM_TIMER => {
             if wparam.0 == HOOK_CHECK_TIMER_ID {
-                check_cursor_with_uia_and_update();
+                poll_cursor_and_update_metrics();
             }
             LRESULT(0)
         }
         WM_TRAYICON => {
             let event = lparam.0 as u32;
             if event == WM_RBUTTONUP {
-                show_tray_menu(hwnd);
+                show_tray_context_menu(hwnd);
             }
             LRESULT(0)
         }
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as u32;
-            if id == 1001 {
+            if id == 1001 { // Defined Exit command identifier
                 PostQuitMessage(0);
             }
             LRESULT(0)
@@ -126,6 +158,8 @@ unsafe extern "system" fn main_wnd_proc(
     }
 }
 
+/// Tooltip window procedure.
+/// Handles GDI (Graphics Device Interface) painting for the memory statistics overlay.
 unsafe extern "system" fn tooltip_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -136,52 +170,60 @@ unsafe extern "system" fn tooltip_wnd_proc(
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
+            
             let mut rect = RECT::default();
             let _ = GetClientRect(hwnd, &mut rect);
 
-            let brush = CreateSolidBrush(COLORREF(0x00262626));
-            FillRect(hdc, &rect, brush);
-            let _ = DeleteObject(brush);
+            // Render background establishing a dark theme aesthetic
+            let bg_brush = CreateSolidBrush(COLORREF(0x0026_2626));
+            FillRect(hdc, &rect, bg_brush);
+            let _ = DeleteObject(bg_brush);
 
-            let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00404040));
-            let old_pen = SelectObject(hdc, pen);
+            // Render subtle perimeter border
+            let border_pen = CreatePen(PS_SOLID, 1, COLORREF(0x0040_4040));
+            let old_pen = SelectObject(hdc, border_pen);
             let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
             let _ = Rectangle(hdc, 0, 0, rect.right, rect.bottom);
             SelectObject(hdc, old_pen);
             SelectObject(hdc, old_brush);
-            let _ = DeleteObject(pen);
+            let _ = DeleteObject(border_pen);
 
             SetBkMode(hdc, TRANSPARENT);
 
-            let full_text = String::from_utf16_lossy(
-                &LAST_TEXT[..LAST_TEXT.len().saturating_sub(1)],
-            );
-            let stats: Vec<&str> = full_text.split('\n').collect();
-
-            let stats_font = CreateFontW(
+            // Configure typography parameters
+            let font = CreateFontW(
                 16, 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0,
                 DEFAULT_CHARSET.0 as u32, OUT_DEFAULT_PRECIS.0 as u32, CLIP_DEFAULT_PRECIS.0 as u32,
                 CLEARTYPE_QUALITY.0 as u32, FF_DONTCARE.0 as u32,
                 w!("Segoe UI"),
             );
 
-            let old_font = SelectObject(hdc, stats_font);
-            SetTextColor(hdc, COLORREF(0x00E0E0E0));
-            let mut y = 10;
-            for line in stats {
-                let mut wline = to_wide(line);  // must be mutable
-                let mut r2 = RECT { left: 12, top: y, right: rect.right - 10, bottom: y + 20 };
+            let old_font = SelectObject(hdc, font);
+            SetTextColor(hdc, COLORREF(0x00E0_E0E0));
+            
+            let mut y_offset = 10;
+            
+            // Render pre-formatted text lines. 
+            // This approach strictly avoids string allocation/UTF-16 conversion overhead during the repaint pipeline.
+            for line in TOOLTIP_LINES.iter_mut() {
+                let mut render_rect = RECT { 
+                    left: 12, 
+                    top: y_offset, 
+                    right: rect.right - 10, 
+                    bottom: y_offset + 20 
+                };
                 DrawTextW(
                     hdc,
-                    &mut wline,
-                    &mut r2,
+                    line,
+                    &mut render_rect,
                     DT_LEFT | DT_SINGLELINE | DT_NOPREFIX,
                 );
-                y += 20;
+                y_offset += 20;
             }
 
+            // Cleanup ephemeral GDI objects to prevent memory leaks
             SelectObject(hdc, old_font);
-            let _ = DeleteObject(stats_font);
+            let _ = DeleteObject(font);
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
@@ -189,6 +231,7 @@ unsafe extern "system" fn tooltip_wnd_proc(
     }
 }
 
+/// Registers the system tray notification icon within the taskbar status area.
 unsafe fn add_tray_icon(hwnd: HWND, instance: HMODULE) -> Result<()> {
     let mut nid = NOTIFYICONDATAW::default();
     nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
@@ -197,7 +240,8 @@ unsafe fn add_tray_icon(hwnd: HWND, instance: HMODULE) -> Result<()> {
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = LoadIconW(None, IDI_APPLICATION)?;
-    let tip = to_wide("App Memory Monitor");
+    
+    let tip = encode_wide("App Memory Monitor");
     let len = tip.len().min(nid.szTip.len());
     nid.szTip[..len].copy_from_slice(&tip[..len]);
 
@@ -205,12 +249,17 @@ unsafe fn add_tray_icon(hwnd: HWND, instance: HMODULE) -> Result<()> {
     Ok(())
 }
 
-unsafe fn show_tray_menu(hwnd: HWND) {
-    let menu = CreatePopupMenu().unwrap();
+/// Displays the context menu for the system tray icon upon a right-click event.
+unsafe fn show_tray_context_menu(hwnd: HWND) {
+    let menu = CreatePopupMenu().unwrap_or_default();
+    if menu.is_invalid() { return; }
+    
     let _ = AppendMenuW(menu, MF_STRING, 1001, w!("Exit"));
 
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
+    
+    // Set the process to foreground to ensure the OS dismisses the menu correctly upon outside clicks
     let _ = SetForegroundWindow(hwnd);
     let _ = TrackPopupMenu(
         menu,
@@ -224,27 +273,30 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let _ = DestroyMenu(menu);
 }
 
-unsafe fn check_cursor_with_uia_and_update() {
+/// Core routine invoked periodically to resolve the UI element under the cursor,
+/// retrieve associated process memory metrics, and update the UI overlay accordingly.
+unsafe fn poll_cursor_and_update_metrics() {
     let mut pt = POINT::default();
     if GetCursorPos(&mut pt).is_err() {
         return;
     }
 
-    
-    let automation = match CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
-        Ok(a) => a,
-        Err(_) => { hide_tooltip(); return; }
+    let automation = match &UI_AUTOMATION_INSTANCE {
+        Some(a) => a,
+        None => return, // Fail gracefully if the COM infrastructure is unavailable
     };
 
+    // Resolve the UI Automation element corresponding to the current cursor coordinates
     let element = match automation.ElementFromPoint(pt) {
         Ok(e) => e,
-        Err(_) => { hide_tooltip(); return; }
+        Err(_) => { hide_tooltip_overlay(); return; }
     };
 
-    
     let mut target_pid: u32 = 0;
+    
+    // Primary resolution technique: Derive PID via Native Window Handle (HWND)
     if let Ok(hwnd) = element.CurrentNativeWindowHandle() {
-        if hwnd.0 != std::ptr::null_mut() {
+        if !hwnd.is_invalid() {
             let mut pid = 0;
             GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32));
             if pid != 0 {
@@ -253,6 +305,7 @@ unsafe fn check_cursor_with_uia_and_update() {
         }
     }
 
+    // Fallback technique: Resolve via direct UI Automation process mapping
     if target_pid == 0 {
         if let Ok(pid) = element.CurrentProcessId() {
             target_pid = pid as u32;
@@ -261,17 +314,32 @@ unsafe fn check_cursor_with_uia_and_update() {
 
     let current_exe_pid = std::process::id();
 
-    if target_pid == 0 || target_pid == current_exe_pid || is_explorer_process(target_pid) {
-        hide_tooltip();
+    // Suppress rendering for the monitor itself or unresolved entities
+    if target_pid == 0 || target_pid == current_exe_pid {
+        hide_tooltip_overlay();
+        LAST_HOVERED_PID = 0;
         return;
     }
 
-    if let Some((name, working_set_mb, private_mb)) = get_process_memory_info(target_pid) {
-        let text = format!(
-            "App: {}\nRAM: {:.1} MB | Priv: {:.1} MB",
-            name, working_set_mb, private_mb
-        );
-        LAST_TEXT = to_wide(&text);
+    // Retrieve comprehensive memory telemetry for the targeted process
+    if let Some((name, working_set_mb, private_mb)) = get_process_memory_telemetry(target_pid) {
+        // Exclude system shell (Explorer) to reduce visual noise during arbitrary taskbar interactions
+        if name.eq_ignore_ascii_case("explorer.exe") {
+            hide_tooltip_overlay();
+            LAST_HOVERED_PID = 0;
+            return;
+        }
+
+        // Cache the formatted strings as UTF-16 once per data change to strictly optimize the WM_PAINT pipeline
+        let line1 = format!("App: {}", name);
+        let line2 = format!("RAM: {:.1} MB | Priv: {:.1} MB", working_set_mb, private_mb);
+        
+        TOOLTIP_LINES.clear();
+        TOOLTIP_LINES.push(encode_wide_with_null(&line1));
+        TOOLTIP_LINES.push(encode_wide_with_null(&line2));
+        LAST_HOVERED_PID = target_pid;
+
+        // Reposition the overlay relative to the cursor and force a repaint invalidation
         let _ = SetWindowPos(
             TOOLTIP_HWND,
             HWND_TOPMOST,
@@ -283,56 +351,67 @@ unsafe fn check_cursor_with_uia_and_update() {
         );
         let _ = InvalidateRect(TOOLTIP_HWND, None, true);
     } else {
-        hide_tooltip();
+        hide_tooltip_overlay();
+        LAST_HOVERED_PID = 0;
     }
-}
-unsafe fn is_explorer_process(pid: u32) -> bool {
-    if let Some((name, _, _)) = get_process_memory_info(pid) {
-        return name.to_lowercase() == "explorer.exe";
-    }
-    false
 }
 
-fn hide_tooltip() {
+/// Suppresses the rendering of the tooltip overlay by manipulating the window state.
+fn hide_tooltip_overlay() {
     unsafe {
         let _ = ShowWindow(TOOLTIP_HWND, SW_HIDE);
     }
 }
 
-unsafe fn get_process_memory_info(pid: u32) -> Option<(String, f64, f64)> {
-    let process = OpenProcess(
+/// Extracts key memory consumption metrics for a given process identifier.
+/// 
+/// Returns a tuple containing:
+/// - Process Executable Name (String)
+/// - Working Set Size in Megabytes (f64)
+/// - Private Memory Usage in Megabytes (f64)
+unsafe fn get_process_memory_telemetry(pid: u32) -> Option<(String, f64, f64)> {
+    let process_handle = OpenProcess(
         PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
         false,
         pid,
-    )
-    .ok()?;
+    ).ok()?;
 
-    let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
-    let ok = K32GetProcessMemoryInfo(
-        process,
-        &mut counters as *mut _ as *mut PROCESS_MEMORY_COUNTERS,
+    let mut mem_counters = PROCESS_MEMORY_COUNTERS_EX::default();
+    let success = K32GetProcessMemoryInfo(
+        process_handle,
+        &mut mem_counters as *mut _ as *mut PROCESS_MEMORY_COUNTERS,
         size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
     );
 
-    let name = get_process_name(process).unwrap_or_else(|| "Unknown".to_string());
-    let _ = CloseHandle(process);
+    let name = resolve_process_name(process_handle).unwrap_or_else(|| "Unknown".to_string());
+    
+    // Deterministic release of the OS resource handle to prevent memory/handle leaks
+    let _ = CloseHandle(process_handle);
 
-    if ok.as_bool() {
-        let working_set_mb = counters.WorkingSetSize as f64 / (1024.0 * 1024.0);
-        let private_mb = counters.PrivateUsage as f64 / (1024.0 * 1024.0);
+    if success.as_bool() {
+        let mb_divisor = 1024.0 * 1024.0;
+        let working_set_mb = mem_counters.WorkingSetSize as f64 / mb_divisor;
+        let private_mb = mem_counters.PrivateUsage as f64 / mb_divisor;
         Some((name, working_set_mb, private_mb))
     } else {
         None
     }
 }
 
-unsafe fn get_process_name(process: HANDLE) -> Option<String> {
-    let mut buffer = [0u16; 260];
-    let mut size = buffer.len() as u32;
-    if QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut size)
-        .is_ok()
-    {
-        let full_path = String::from_utf16_lossy(&buffer[..size as usize]);
+/// Resolves the executable filename associated with an active process handle.
+unsafe fn resolve_process_name(process_handle: HANDLE) -> Option<String> {
+    let mut buffer = [0u16; MAX_PATH as usize];
+    let mut buffer_size = buffer.len() as u32;
+    
+    // Query the OS for the fully qualified path of the process image
+    if QueryFullProcessImageNameW(
+        process_handle, 
+        PROCESS_NAME_WIN32, 
+        PWSTR(buffer.as_mut_ptr()), 
+        &mut buffer_size
+    ).is_ok() {
+        let full_path = String::from_utf16_lossy(&buffer[..buffer_size as usize]);
+        // Isolate the executable filename from the absolute path string
         let file_name = full_path
             .rsplit('\\')
             .next()
@@ -344,6 +423,13 @@ unsafe fn get_process_name(process: HANDLE) -> Option<String> {
     }
 }
 
-fn to_wide(s: &str) -> Vec<u16> {
+/// Encodes a standard Rust string into a standard UTF-16 representation.
+fn encode_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+/// Encodes a standard Rust string into a null-terminated UTF-16 representation,
+/// suitable for Win32 API interop (e.g., DrawTextW).
+fn encode_wide_with_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
