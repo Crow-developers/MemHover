@@ -280,46 +280,68 @@ unsafe fn show_tray_context_menu(hwnd: HWND) {
 /// Determines whether the cursor is currently positioned over the Windows Taskbar
 /// or the System Tray notification area.
 ///
-/// Resolution strategy: Traverses the complete parent window chain from the window
-/// directly under the cursor upward, checking each ancestor's class name against
-/// well-known taskbar identifiers. This approach is robust across Windows 10 and 11,
-/// where the internal taskbar window hierarchy may differ significantly.
-///
-/// Recognized taskbar class names:
-/// - `Shell_TrayWnd`              → Primary taskbar (Win10/11)
-/// - `Shell_SecondaryTrayWnd`     → Secondary monitor taskbar
-/// - `NotifyIconOverflowWindow`   → System tray overflow (hidden icons)
+/// Resolution strategy: Obtains the top-level root window using `GA_ROOT` and inspects
+/// its class name against well-known taskbar identifiers (including Windows 11 XAML hosts).
+/// As a robust fallback, it permits any window owned by `explorer.exe` (the Windows Shell),
+/// while explicitly filtering out the Desktop (`Progman` / `WorkerW`).
 unsafe fn is_cursor_over_taskbar_or_tray(pt: POINT) -> bool {
-    let mut hwnd = WindowFromPoint(pt);
+    let hwnd = WindowFromPoint(pt);
     if hwnd.is_invalid() {
         return false;
     }
 
-    // Walk the complete ancestor chain rather than jumping directly to the root,
-    // as Windows 11 introduced a multi-level taskbar window hierarchy that breaks
-    // the simpler GA_ROOT approach used in prior Windows versions.
-    loop {
-        let mut class_buf = [0u16; 256];
-        let char_count = GetClassNameW(hwnd, &mut class_buf);
+    let root_hwnd = GetAncestor(hwnd, GA_ROOT);
+    if root_hwnd.is_invalid() {
+        return false;
+    }
 
-        if char_count > 0 {
-            let class_name = String::from_utf16_lossy(&class_buf[..char_count as usize]);
-            match class_name.as_str() {
-                "Shell_TrayWnd"
-                | "Shell_SecondaryTrayWnd"
-                | "NotifyIconOverflowWindow" => return true,
-                _ => {}
-            }
+    let mut class_buf = [0u16; 256];
+    let char_count = GetClassNameW(root_hwnd, &mut class_buf);
+
+    if char_count > 0 {
+        let class_name = String::from_utf16_lossy(&class_buf[..char_count as usize]);
+        match class_name.as_str() {
+            "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "NotifyIconOverflowWindow"
+            | "XamlExplorerHostIslandWindow" => return true,
+            "Progman" | "WorkerW" => return false, // Explicitly block the desktop
+            _ => {}
         }
+    }
 
-        // Advance to the next ancestor; terminate if the chain is exhausted
-        match GetParent(hwnd) {
-            Ok(parent) if !parent.is_invalid() => hwnd = parent,
-            _ => break,
+    // Fallback: Check if the window belongs to explorer.exe (Windows Shell)
+    let mut cursor_pid = 0;
+    GetWindowThreadProcessId(root_hwnd, Some(&mut cursor_pid as *mut u32));
+    if cursor_pid != 0 {
+        let process_name = get_process_name(cursor_pid);
+        if process_name.eq_ignore_ascii_case("explorer.exe") {
+            return true;
         }
     }
 
     false
+}
+
+/// Lightweight helper to retrieve just the executable name of a process.
+unsafe fn get_process_name(pid: u32) -> String {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows::Win32::System::ProcessStatus::K32GetProcessImageFileNameW;
+    use windows::Win32::Foundation::CloseHandle;
+
+    if let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+        let mut buf = [0u16; 512];
+        let len = K32GetProcessImageFileNameW(handle, &mut buf);
+        let _ = CloseHandle(handle);
+        if len > 0 {
+            let path = String::from_utf16_lossy(&buf[..len as usize]);
+            if let Some(idx) = path.rfind('\\') {
+                return path[idx + 1..].to_string();
+            }
+            return path;
+        }
+    }
+    String::new()
 }
 
 
@@ -375,6 +397,30 @@ unsafe fn poll_cursor_and_update_metrics() {
         }
     }
 
+    let mut is_explorer = false;
+    
+    // Check if target_pid is explorer.exe
+    if target_pid != 0 {
+        if let Some((name, _, _)) = get_process_memory_telemetry(target_pid) {
+            if name.eq_ignore_ascii_case("explorer.exe") {
+                is_explorer = true;
+            }
+        }
+    }
+
+    if is_explorer {
+        // Attempt to resolve the real target by window title mapping (Taskbar fallback)
+        if let Ok(uia_name_bstr) = element.CurrentName() {
+            let uia_name = uia_name_bstr.to_string();
+            if !uia_name.is_empty() {
+                let resolved_pid = find_pid_by_window_title(&uia_name);
+                if resolved_pid != 0 {
+                    target_pid = resolved_pid;
+                }
+            }
+        }
+    }
+
     let current_exe_pid = std::process::id();
 
     // Suppress rendering for the monitor itself or unresolved entities
@@ -395,7 +441,7 @@ unsafe fn poll_cursor_and_update_metrics() {
 
         // Cache the formatted strings as UTF-16 once per data change to strictly optimize the WM_PAINT pipeline
         let line1 = format!("App: {}", name);
-        let line2 = format!("RAM: {:.1} MB | Priv: {:.1} MB", working_set_mb, private_mb);
+        let line2 = format!("Total WS: {:.1} MB | Commit: {:.1} MB", working_set_mb, private_mb);
         
         // Mutate the static buffer through a raw pointer to comply with Rust 2024 strict aliasing rules.
         let lines = &mut *std::ptr::addr_of_mut!(TOOLTIP_LINES);
@@ -405,13 +451,14 @@ unsafe fn poll_cursor_and_update_metrics() {
         LAST_HOVERED_PID = target_pid;
 
         // Reposition the overlay relative to the cursor and force a repaint invalidation
+        // Dimensions increased to 300x70 to accommodate longer "Total WS" and "Commit" text labels.
         let _ = SetWindowPos(
             TOOLTIP_HWND,
             HWND_TOPMOST,
             pt.x + 12,
-            pt.y - 55,
-            210,
-            65,
+            pt.y - 70, // Shift up slightly more to avoid cursor overlap
+            300,       // Wider width to prevent horizontal clipping of MB text
+            70,        // Taller height for breathing room
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
         let _ = InvalidateRect(TOOLTIP_HWND, None, true);
@@ -426,6 +473,44 @@ fn hide_tooltip_overlay() {
     unsafe {
         let _ = ShowWindow(TOOLTIP_HWND, SW_HIDE);
     }
+}
+
+struct EnumState {
+    target_name: String,
+    found_pid: u32,
+}
+
+unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let state = &mut *(lparam.0 as *mut EnumState);
+    let mut buf = [0u16; 512];
+    let len = GetWindowTextW(hwnd, &mut buf);
+    if len > 0 {
+        let title = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
+        let target = state.target_name.to_lowercase();
+        
+        // Use a broad containment check since Taskbar UIA names often append/prepend extra text
+        // (e.g., "New Tab - Brave" vs "Brave") or omit document titles.
+        if title.contains(&target) || target.contains(&title) {
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32));
+            if pid != 0 {
+                state.found_pid = pid;
+                return BOOL(0); // Stop enumerating
+            }
+        }
+    }
+    BOOL(1)
+}
+
+fn find_pid_by_window_title(name: &str) -> u32 {
+    let mut state = EnumState {
+        target_name: name.to_string(),
+        found_pid: 0,
+    };
+    unsafe {
+        let _ = EnumWindows(Some(enum_windows_callback), LPARAM(&mut state as *mut _ as isize));
+    }
+    state.found_pid
 }
 
 /// Extracts key memory consumption metrics for a given process identifier.
