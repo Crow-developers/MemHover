@@ -239,7 +239,11 @@ unsafe fn add_tray_icon(hwnd: HWND, instance: HMODULE) -> Result<()> {
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadIconW(None, IDI_APPLICATION)?;
+    // Attempt to load the embedded custom icon (Resource ID 1), fallback to default if it fails
+    nid.hIcon = match LoadIconW(instance, PCWSTR(1 as _)) {
+        Ok(icon) => icon,
+        Err(_) => LoadIconW(None, IDI_APPLICATION)?,
+    };
     
     let tip = encode_wide("App Memory Monitor");
     let len = tip.len().min(nid.szTip.len());

@@ -29,3 +29,6 @@ windows = { version = "0.58", features = [
     "Win32_UI_Accessibility", # مضافة خصيصاً لدعم UI Automation
     "Win32_System_Com",
 ] }
+
+[build-dependencies]
+winres = "0.1"
