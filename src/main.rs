@@ -172,7 +172,7 @@ unsafe extern "system" fn tooltip_wnd_proc(
             let hdc = BeginPaint(hwnd, &mut ps);
 
             // Dark background
-            let mut rect = RECT { left: 0, top: 0, right: 300, bottom: 70 };
+            let mut rect = RECT { left: 0, top: 0, right: 255, bottom: 70 };
             let bg_brush = CreateSolidBrush(COLORREF(0x001C_1C1C));
             let _ = FillRect(hdc, &rect, bg_brush);
             let _ = DeleteObject(bg_brush);
@@ -356,7 +356,7 @@ unsafe fn poll_cursor_and_update_metrics() {
             lines.push(encode_wide_with_null(&line2));
             let _ = SetWindowPos(
                 TOOLTIP_HWND, HWND_TOPMOST,
-                pt.x + 12, pt.y - 70, 300, 70,
+                pt.x + 12, pt.y - 70, 255, 70,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
             let _ = InvalidateRect(TOOLTIP_HWND, None, true);
