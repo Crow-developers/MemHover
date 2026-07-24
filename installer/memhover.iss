@@ -4,10 +4,11 @@
 ; ============================================================
 
 #define AppName      "MemHover"
-#define AppVersion   "1.0.0"
+#define AppVersion   "0.1.0"
 #define AppPublisher "Crow-developers"
 #define AppURL       "https://github.com/Hussein-Furaty/MemHover"
 #define AppExeName   "memhover.exe"
+
 
 [Setup]
 AppId={{8F3A2C1D-4E7B-4F9A-A123-0D1E2F3A4B5C}
