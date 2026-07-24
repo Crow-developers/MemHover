@@ -25,8 +25,7 @@
 
 <div align="center">
 
-<!-- ↓ Place your screenshot at assets/screenshot.png and rename below ↓ -->
-> 🖼️ *Screenshot coming soon — place yours at `assets/screenshot.png`*
+<img src="assets/screenshot.png" width="780" alt="MemHover in action — real-time RAM tooltip on taskbar hover" />
 
 </div>
 
